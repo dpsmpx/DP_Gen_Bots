@@ -363,13 +363,11 @@ begin
   end;
   
   ResetField;
+  // Позиции ботов и метки BotCell на полях уже расставлены в ResetField.
+  // Трогать их здесь нельзя: координаты разъедутся с содержимым полей.
   var direction := Random(4);
-  var position := FindEmptyPosition(0);
   for botIndex := 0 to MAXIMUM_BOTS - 1 do
   begin
-    bots[botIndex].active := true;
-    bots[botIndex].x := position.X;
-    bots[botIndex].y := position.Y;
     bots[botIndex].direction := direction;
     bots[botIndex].genomePosition := 0;
     bots[botIndex].actionCount := 0;
@@ -392,6 +390,7 @@ begin
   
   DrawRectangledText(WINDOW_WIDTH div 2 - 150, WINDOW_HEIGHT div 2 - 20, 300, 40, 'Ожидайте стабилизации графика...');
   Redraw;
+  generationStartTime := Milliseconds;
 end;
 
 procedure AddGenerationDuration(newDuration: real);
@@ -526,7 +525,7 @@ begin
       parent2 := survivorIndices[0];
       for rowIndex := 0 to High(survivorIndices) do
       begin
-        fitnessSum := bots[survivorIndices[rowIndex]].fitness + 1;
+        fitnessSum += bots[survivorIndices[rowIndex]].fitness + 1;
         if fitnessSum >= randomFitness2 then
         begin
           parent2 := survivorIndices[rowIndex];
@@ -1012,9 +1011,9 @@ end;
 
 procedure HandleInput;
 begin
-  if KeyPressed then
+  if AnyKeyPressed then
   begin
-    while KeyPressed do;
+    while AnyKeyPressed do;
     isSimulationRendered := not isSimulationRendered;
   end;
   if MousePressed then

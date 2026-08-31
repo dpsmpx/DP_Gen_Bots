@@ -3,7 +3,15 @@ uses GraphABC, DP_Control, DP_Interface;
 const
   MAXIMUM_BOTS          = 128;
   MINIMUM_BOTS          = 32;
-  GENOME_LENGTH         = 32;
+  ///Длина генома. Гены хранят значения 0..GENOME_LENGTH-1 и служат
+  ///одновременно кодом команды (по остатку от COMMAND_COUNT) и смещением
+  ///перехода. Поэтому мутация одного гена осмысленно меняет обе роли.
+  GENOME_LENGTH         = 64;
+  ///Сколько различных команд понимает бот
+  COMMAND_COUNT         = 6;
+  ///Сколько ситуаций различает сенсор команды 4; столько же генов подряд
+  ///после неё образуют таблицу переходов
+  SENSOR_SITUATIONS     = 6;
   FIELD_WIDTH           = 30;
   FIELD_HEIGHT          = 30;
   PIXEL_SIZE            = 15;
@@ -17,7 +25,10 @@ const
   MUTATION_INCREMENT    = 0.01;
   MUTATION_DECREMENT    = 0.005;
   MAXIMUM_ACTIONS       = 500;
-  FITNESS_THRESHOLD     = 10;
+  ///Порог средней приспособленности, выше которого среда усложняется
+  FITNESS_THRESHOLD     = 40;
+  ///Как часто пересматриваются мутация и сложность среды, в поколениях
+  ENVIRONMENT_ADAPT_INTERVAL = 25;
   MINIMUM_APPLES        = 5;
   MAXIMUM_WALLS         = 360;
   INITIAL_APPLES        = 30;
@@ -81,7 +92,11 @@ var
   wallColor: Color := clBlack;
   appleColor: Color := clGreen;
   poisonColor: Color := clRed;
-  previousAverageFitness: real := 0;
+  ///Средняя приспособленность за предыдущее окно наблюдения
+  previousWindowAverage: real := 0;
+  ///Накопитель приспособленности внутри текущего окна
+  windowFitnessSum: real := 0;
+  windowGenerations: integer := 0;
   stagnationCounter: integer := 0;
   currentMutationRate: real := BASE_MUTATION_RATE;
   currentAppleCount: integer := INITIAL_APPLES;
@@ -261,9 +276,7 @@ end;
 
 procedure ExecuteCommand(botIndex: integer; var bot: Bot);
 var
-  frontPosition, leftPosition, rightPosition, farFrontPosition: Point;
-  jumpTarget: integer;
-  hasMoved: boolean;
+  frontPosition, leftPosition, rightPosition: Point;
 begin
   if bot.actionCount >= MAXIMUM_ACTIONS then
   begin
@@ -271,8 +284,10 @@ begin
     exit;
   end;
   
-  hasMoved := false;
-  case bot.genome[bot.genomePosition] of
+  // Ген хранит число 0..GENOME_LENGTH-1; команда — остаток от деления на
+  // число команд. Одно и то же значение служит и командой, и смещением
+  // перехода, поэтому мутация гена осмысленна в обеих ролях.
+  case bot.genome[bot.genomePosition] mod COMMAND_COUNT of
     0:
       begin
         frontPosition := GetFrontPosition(bot.x, bot.y, bot.direction);
@@ -283,7 +298,6 @@ begin
               bot.x := frontPosition.X;
               bot.y := frontPosition.Y;
               botFields[botIndex, bot.x, bot.y] := BotCell;
-              hasMoved := true;
               if not bot.visited[bot.x, bot.y] then
               begin
                 bot.visited[bot.x, bot.y] := true;
@@ -299,7 +313,6 @@ begin
               bot.fitness += FITNESS_APPLE;
               botAppleCount[botIndex] -= 1;
               PlaceApple(botIndex);
-              hasMoved := true;
               if not bot.visited[bot.x, bot.y] then
               begin
                 bot.visited[bot.x, bot.y] := true;
@@ -343,48 +356,45 @@ begin
           botFields[botIndex, frontPosition.X, frontPosition.Y] := Empty;
           bot.fitness += FITNESS_KILL_POISON;
           PlaceApple(botIndex);
-          hasMoved := true;
         end;
         bot.genomePosition := (bot.genomePosition + 1) mod GENOME_LENGTH;
       end;
     4:
       begin
+        // Сенсор. Раньше переход шёл на абсолютный адрес 0..3, поэтому всё
+        // ветвление упиралось в первые клетки генома, а ветки "яблоко
+        // впереди" и "ничего не найдено" давали один и тот же адрес и были
+        // неразличимы. Теперь ситуация выбирает элемент таблицы переходов,
+        // лежащей в следующих SENSOR_SITUATIONS генах, а сам переход
+        // относительный.
         frontPosition := GetFrontPosition(bot.x, bot.y, bot.direction);
         leftPosition := GetFrontPosition(bot.x, bot.y, (bot.direction - 1 + 4) mod 4);
         rightPosition := GetFrontPosition(bot.x, bot.y, (bot.direction + 1) mod 4);
-        farFrontPosition.X := frontPosition.X;
-        farFrontPosition.Y := frontPosition.Y;
-        var isFarValid := true;
-        case bot.direction of
-          0: if frontPosition.Y = 0 then isFarValid := false else farFrontPosition.Y := frontPosition.Y - 1;
-          1: if frontPosition.X = FIELD_WIDTH - 1 then isFarValid := false else farFrontPosition.X := frontPosition.X + 1;
-          2: if frontPosition.Y = FIELD_HEIGHT - 1 then isFarValid := false else farFrontPosition.Y := frontPosition.Y + 1;
-          3: if frontPosition.X = 0 then isFarValid := false else farFrontPosition.X := frontPosition.X - 1;
-        end;
-        
+
+        var situation: integer;
         if botFields[botIndex, frontPosition.X, frontPosition.Y] = Apple then
-          jumpTarget := 0
-        else if botFields[botIndex, leftPosition.X, leftPosition.Y] = Apple then
-          jumpTarget := 2
-        else if botFields[botIndex, rightPosition.X, rightPosition.Y] = Apple then
-          jumpTarget := 1
+          situation := 0
         else if botFields[botIndex, frontPosition.X, frontPosition.Y] = Poison then
-          jumpTarget := 3
-        else if botFields[botIndex, leftPosition.X, leftPosition.Y] = Poison then
-          jumpTarget := 2
-        else if botFields[botIndex, rightPosition.X, rightPosition.Y] = Poison then
-          jumpTarget := 1
+          situation := 1
         else if botFields[botIndex, frontPosition.X, frontPosition.Y] = Wall then
-          jumpTarget := bot.genome[(bot.genomePosition + 1) mod GENOME_LENGTH]
-        else if isFarValid and (botFields[botIndex, farFrontPosition.X, farFrontPosition.Y] = Apple) then
-          jumpTarget := 0
+          situation := 2
+        else if botFields[botIndex, leftPosition.X, leftPosition.Y] = Apple then
+          situation := 3
+        else if botFields[botIndex, rightPosition.X, rightPosition.Y] = Apple then
+          situation := 4
         else
-          jumpTarget := 0;
-        bot.genomePosition := jumpTarget mod GENOME_LENGTH;
+          situation := 5;
+
+        var offset := bot.genome[(bot.genomePosition + 1 + situation) mod GENOME_LENGTH];
+        bot.genomePosition := (bot.genomePosition + offset) mod GENOME_LENGTH;
       end;
     5:
       begin
-        bot.genomePosition := bot.genome[(bot.genomePosition + 1) mod GENOME_LENGTH] mod GENOME_LENGTH;
+        // Безусловный относительный переход. Раньше адрес брался как
+        // genome[...] mod GENOME_LENGTH, но гены хранили только 0..5,
+        // поэтому попасть можно было лишь в первые шесть клеток генома.
+        var offset := bot.genome[(bot.genomePosition + 1) mod GENOME_LENGTH];
+        bot.genomePosition := (bot.genomePosition + offset) mod GENOME_LENGTH;
       end;
   end;
   
@@ -459,17 +469,13 @@ begin
     for rowIndex := 0 to FIELD_WIDTH - 1 do
       for colIndex := 0 to FIELD_HEIGHT - 1 do
         bots[botIndex].visited[rowIndex, colIndex] := false;
+    // Заплатки "дослать недостающие команды" здесь больше нет: она могла
+    // затереть единственное вхождение другой команды, а её проверка этого
+    // уже не замечала. При декодировании по остатку любая команда
+    // достижима из любого значения гена, и в геноме из 64 генов все шесть
+    // команд присутствуют практически наверняка.
     for colIndex := 0 to GENOME_LENGTH - 1 do
-      bots[botIndex].genome[colIndex] := Random(6);
-    var commandsPresent: array[0..5] of boolean;
-    for colIndex := 0 to GENOME_LENGTH - 1 do
-      commandsPresent[bots[botIndex].genome[colIndex]] := true;
-    for var command := 0 to 5 do
-      if not commandsPresent[command] then
-      begin
-        var randomIndex := Random(GENOME_LENGTH);
-        bots[botIndex].genome[randomIndex] := command;
-      end;
+      bots[botIndex].genome[colIndex] := Random(GENOME_LENGTH);
   end;
   
   DrawRectangledText(WINDOW_WIDTH div 2 - 150, WINDOW_HEIGHT div 2 - 20, 300, 40, 'Ожидайте стабилизации графика...');
@@ -542,33 +548,51 @@ begin
   
   AddAverageFitness(currentAverageFitness);
   
-  if currentAverageFitness <= previousAverageFitness then
+  // Мутация и сложность среды пересматриваются раз в
+  // ENVIRONMENT_ADAPT_INTERVAL поколений, по среднему за окно. Раньше это
+  // делалось каждое поколение, и контур управления реагировал на
+  // собственные действия: добавление десяти стен роняло среднюю
+  // приспособленность, падение засчитывалось как стагнация и поднимало
+  // мутацию, хотя популяция не деградировала — усложнилась задача.
+  windowFitnessSum += currentAverageFitness;
+  Inc(windowGenerations);
+  if windowGenerations >= ENVIRONMENT_ADAPT_INTERVAL then
   begin
-    stagnationCounter += 1;
-    if stagnationCounter >= STAGNATION_THRESHOLD then
-      currentMutationRate := Minimum(BASE_MUTATION_RATE + (stagnationCounter - STAGNATION_THRESHOLD + 1) * MUTATION_INCREMENT, MAXIMUM_MUTATION_RATE);
-  end
-  else
-  begin
-    stagnationCounter := 0;
-    if currentMutationRate > BASE_MUTATION_RATE then
-      currentMutationRate := Maximum(currentMutationRate - MUTATION_DECREMENT, BASE_MUTATION_RATE);
-  end;
-  previousAverageFitness := currentAverageFitness;
-  
-  if currentAverageFitness > FITNESS_THRESHOLD then
-  begin
-    if currentAppleCount > MINIMUM_APPLES then
-      currentAppleCount -= 1;
-    if currentWallCount < MAXIMUM_WALLS then
-      currentWallCount += 10;
-  end
-  else
-  begin
-    if currentAppleCount < INITIAL_APPLES then
-      currentAppleCount += 1;
-    if currentWallCount > INITIAL_WALLS then
-      currentWallCount -= 10;
+    var windowAverage := windowFitnessSum / windowGenerations;
+
+    if windowAverage <= previousWindowAverage then
+    begin
+      stagnationCounter += 1;
+      if stagnationCounter >= STAGNATION_THRESHOLD then
+        currentMutationRate := Minimum(BASE_MUTATION_RATE + (stagnationCounter - STAGNATION_THRESHOLD + 1) * MUTATION_INCREMENT, MAXIMUM_MUTATION_RATE);
+    end
+    else
+    begin
+      stagnationCounter := 0;
+      if currentMutationRate > BASE_MUTATION_RATE then
+        currentMutationRate := Maximum(currentMutationRate - MUTATION_DECREMENT, BASE_MUTATION_RATE);
+    end;
+    previousWindowAverage := windowAverage;
+
+    // Гистерезис: усложняем выше порога, упрощаем сильно ниже него, между
+    // ними среда не трогается. Иначе сложность колеблется туда-сюда.
+    if windowAverage > FITNESS_THRESHOLD then
+    begin
+      if currentAppleCount > MINIMUM_APPLES then
+        currentAppleCount -= 1;
+      if currentWallCount < MAXIMUM_WALLS then
+        currentWallCount += 10;
+    end
+    else if windowAverage < FITNESS_THRESHOLD / 2 then
+    begin
+      if currentAppleCount < INITIAL_APPLES then
+        currentAppleCount += 1;
+      if currentWallCount > INITIAL_WALLS then
+        currentWallCount -= 10;
+    end;
+
+    windowFitnessSum := 0;
+    windowGenerations := 0;
   end;
   
   SetLength(survivorIndices, MAXIMUM_BOTS);
@@ -655,9 +679,9 @@ begin
     for colIndex := 0 to GENOME_LENGTH - 1 do
     begin
       if Random < currentMutationRate then
-        child1.genome[colIndex] := Random(6);
+        child1.genome[colIndex] := Random(GENOME_LENGTH);
       if Random < currentMutationRate then
-        child2.genome[colIndex] := Random(6);
+        child2.genome[colIndex] := Random(GENOME_LENGTH);
     end;
     
     if newBotIndex < MAXIMUM_BOTS then
@@ -1049,7 +1073,7 @@ begin
       // действий здесь больше нет.
       var remainingCommands := maximumThinkTime - 1;
       while (remainingCommands > 0) and bots[rowIndex].active and
-            (bots[rowIndex].genome[bots[rowIndex].genomePosition] <> 0) do
+            (bots[rowIndex].genome[bots[rowIndex].genomePosition] mod COMMAND_COUNT <> 0) do
       begin
         ExecuteCommand(rowIndex, bots[rowIndex]);
         remainingCommands -= 1;

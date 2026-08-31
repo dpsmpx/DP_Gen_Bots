@@ -20,6 +20,18 @@ const
   FITNESS_THRESHOLD     = 10;
   MINIMUM_APPLES        = 5;
   MAXIMUM_WALLS         = 360;
+  INITIAL_APPLES        = 30;
+  INITIAL_WALLS         = 270;
+  POISON_COUNT          = 10;
+  ///Награда за съеденное яблоко
+  FITNESS_APPLE         = 6;
+  ///Награда за уничтожение яда перед собой
+  FITNESS_KILL_POISON   = 3;
+  ///Награда за первое посещение клетки
+  FITNESS_NEW_CELL      = 1;
+  ///Зерно генератора случайных чисел. Фиксировано, чтобы прогоны были
+  ///воспроизводимы; поставьте 0, чтобы каждый запуск отличался.
+  RANDOM_SEED           = 20240816;
 
 type
   CellType = (Empty, Wall, Apple, Poison, BotCell);
@@ -50,6 +62,15 @@ var
   generationDurations: array of real;
   averageFitnessHistory: array of real;
   historySegmentCount: integer := 100;
+  ///Сколько элементов истории реально заполнено. Без этого первые сто
+  ///поколений рисуются вместе с нулями-заполнителями, которые сбивают
+  ///и масштаб графика, и подписи под ним.
+  historyFilled: integer := 0;
+  ///Максимальная приспособленность в последнем поколении
+  currentMaximumFitness: integer := 0;
+  ///Файл журнала прогона
+  logFile: Text;
+  isLogOpen: boolean := False;
   ///Что показывать в окне: поле симуляции или график по поколениям
   viewMode: ViewModeType := ViewGraph;
   isSimulationPaused: boolean := False;
@@ -63,11 +84,11 @@ var
   previousAverageFitness: real := 0;
   stagnationCounter: integer := 0;
   currentMutationRate: real := BASE_MUTATION_RATE;
-  currentAppleCount: integer := 30;
+  currentAppleCount: integer := INITIAL_APPLES;
   ///Сколько яблок сейчас на поле каждого бота. Позволяет не обходить
   ///все 900 клеток каждый такт ради подсчёта.
   botAppleCount: array[0..MAXIMUM_BOTS - 1] of integer;
-  currentWallCount: integer := 270;
+  currentWallCount: integer := INITIAL_WALLS;
 
 procedure ResetField; forward;
 
@@ -228,6 +249,16 @@ begin
   end;
 end;
 
+/// Снимает бота с поля. Счётчик живых уменьшается ровно один раз:
+/// повторный вызов для уже погибшего бота ничего не делает.
+procedure KillBot(botIndex: integer; var bot: Bot);
+begin
+  if not bot.active then exit;
+  bot.active := false;
+  botFields[botIndex, bot.x, bot.y] := Empty;
+  Dec(activeBotCount);
+end;
+
 procedure ExecuteCommand(botIndex: integer; var bot: Bot);
 var
   frontPosition, leftPosition, rightPosition, farFrontPosition: Point;
@@ -236,8 +267,7 @@ var
 begin
   if bot.actionCount >= MAXIMUM_ACTIONS then
   begin
-    bot.active := false;
-    botFields[botIndex, bot.x, bot.y] := Empty;
+    KillBot(botIndex, bot);
     exit;
   end;
   
@@ -257,7 +287,7 @@ begin
               if not bot.visited[bot.x, bot.y] then
               begin
                 bot.visited[bot.x, bot.y] := true;
-                bot.fitness += 1;
+                bot.fitness += FITNESS_NEW_CELL;
               end;
             end;
           Apple:
@@ -266,43 +296,44 @@ begin
               bot.x := frontPosition.X;
               bot.y := frontPosition.Y;
               botFields[botIndex, bot.x, bot.y] := BotCell;
-              bot.fitness += 6;
+              bot.fitness += FITNESS_APPLE;
               botAppleCount[botIndex] -= 1;
               PlaceApple(botIndex);
               hasMoved := true;
               if not bot.visited[bot.x, bot.y] then
               begin
                 bot.visited[bot.x, bot.y] := true;
-                bot.fitness += 1;
+                bot.fitness += FITNESS_NEW_CELL;
               end;
             end;
           Poison:
             begin
+              // Раньше эта ветка посимвольно совпадала с Empty: яд молча
+              // стирался, штрафа не было, да ещё и начислялся плюс за новую
+              // клетку. Отличать яд от пустоты эволюции было незачем, и весь
+              // сенсорный аппарат команды 4 оставался бесполезен.
               botFields[botIndex, bot.x, bot.y] := Empty;
               bot.x := frontPosition.X;
               bot.y := frontPosition.Y;
-              botFields[botIndex, bot.x, bot.y] := BotCell;
-              hasMoved := true;
-              if not bot.visited[bot.x, bot.y] then
-              begin
-                bot.visited[bot.x, bot.y] := true;
-                bot.fitness += 1;
-              end;
+              bot.actionCount += 1;
+              KillBot(botIndex, bot);
+              exit;
             end;
         end;
         bot.genomePosition := (bot.genomePosition + 1) mod GENOME_LENGTH;
       end;
     1:
       begin
+        // Награды за поворот здесь быть не должно. Пока она была, геном из
+        // одних поворотов набирал полный лимит очков, ничего не делая и
+        // ничем не рискуя, и вытеснял из элиты любую осмысленную стратегию.
         bot.direction := (bot.direction + 1) mod 4;
         bot.genomePosition := (bot.genomePosition + 1) mod GENOME_LENGTH;
-        bot.fitness += 1;
       end;
     2:
       begin
         bot.direction := (bot.direction - 1 + 4) mod 4;
         bot.genomePosition := (bot.genomePosition + 1) mod GENOME_LENGTH;
-        bot.fitness += 1;
       end;
     3:
       begin
@@ -310,7 +341,7 @@ begin
         if botFields[botIndex, frontPosition.X, frontPosition.Y] = Poison then
         begin
           botFields[botIndex, frontPosition.X, frontPosition.Y] := Empty;
-          bot.fitness += 3;
+          bot.fitness += FITNESS_KILL_POISON;
           PlaceApple(botIndex);
           hasMoved := true;
         end;
@@ -385,6 +416,23 @@ procedure Initialize;
 var
   rowIndex, colIndex, botIndex: integer;
 begin
+  // Фиксированное зерно делает прогон воспроизводимым: два запуска дают
+  // одинаковый CSV, и упавший или интересный прогон можно повторить.
+  if RANDOM_SEED <> 0 then
+    Randomize(RANDOM_SEED)
+  else
+    Randomize;
+
+  try
+    Assign(logFile, 'gen_bots_log.csv');
+    Rewrite(logFile);
+    Writeln(logFile, 'generation;avg_fitness;max_fitness;mutation_rate;apples;walls;duration_ms');
+    isLogOpen := True;
+  except
+    // Журнал не критичен: если файл занят или недоступен, симуляция идёт без него
+    isLogOpen := False;
+  end;
+
   SetWindowTitle('Генетические боты');
   SetWindowSize(WINDOW_WIDTH, WINDOW_HEIGHT);
   CenterWindow;
@@ -445,11 +493,32 @@ begin
   for index := averageFitnessHistory.Length - 1 downto 1 do
     averageFitnessHistory[index] := averageFitnessHistory[index - 1];
   averageFitnessHistory[0] := newFitness;
+  if historyFilled < historySegmentCount then
+    Inc(historyFilled);
+end;
+
+/// Дописывает строку журнала. Прогон при фиксированном зерне
+/// воспроизводим, поэтому CSV можно сравнивать между запусками.
+procedure LogGeneration(durationMs: real);
+begin
+  if not isLogOpen then exit;
+  Writeln(logFile,
+    generationNumber, ';',
+    averageFitnessHistory[0].ToString('F2'), ';',
+    currentMaximumFitness, ';',
+    currentMutationRate.ToString('F4'), ';',
+    currentAppleCount, ';',
+    currentWallCount, ';',
+    Round(durationMs));
+  Flush(logFile);
 end;
 
 procedure UpdateStatus;
 begin
-  SetWindowTitle('GenBots | Gen: ' + generationNumber.ToString + ' | Alive: ' + activeBotCount.ToString);
+  SetWindowTitle('GenBots | поколение ' + generationNumber.ToString +
+                 ' | живых ' + activeBotCount.ToString +
+                 ' | средняя ' + averageFitnessHistory[0].ToString('F1') +
+                 ' | мутация ' + currentMutationRate.ToString('F3'));
 end;
 
 procedure CreateNewPopulation;
@@ -462,8 +531,13 @@ var
   currentAverageFitness: real;
 begin
   currentAverageFitness := 0;
+  currentMaximumFitness := bots[0].fitness;
   for rowIndex := 0 to MAXIMUM_BOTS - 1 do
+  begin
     currentAverageFitness += bots[rowIndex].fitness;
+    if bots[rowIndex].fitness > currentMaximumFitness then
+      currentMaximumFitness := bots[rowIndex].fitness;
+  end;
   currentAverageFitness := currentAverageFitness / MAXIMUM_BOTS;
   
   AddAverageFitness(currentAverageFitness);
@@ -491,9 +565,9 @@ begin
   end
   else
   begin
-    if currentAppleCount < 30 then
+    if currentAppleCount < INITIAL_APPLES then
       currentAppleCount += 1;
-    if currentWallCount > 270 then
+    if currentWallCount > INITIAL_WALLS then
       currentWallCount -= 10;
   end;
   
@@ -641,6 +715,23 @@ var
     Dec(emptyCount);
   end;
 
+  /// Случайная свободная клетка в подготавливаемом поле, или (-1, -1)
+  function FindEmptyInTemp: Point;
+  var
+    attempts: integer;
+  begin
+    attempts := 0;
+    repeat
+      Result := Point.Create(Random(FIELD_WIDTH), Random(FIELD_HEIGHT));
+      Inc(attempts);
+      if attempts > 1000 then
+      begin
+        Result := Point.Create(-1, -1);
+        exit;
+      end;
+    until tempField[Result.X, Result.Y] = Empty;
+  end;
+
   function IsValidMove(x, y: integer): boolean;
   begin
     Result := (x >= 0) and (x < FIELD_WIDTH) and 
@@ -773,97 +864,117 @@ begin
     end;
   end;
 
-  // Копирование поля для ботов
+  // Одна раскладка на всё поколение. Раньше стартовая клетка и позиции
+  // всех яблок и яда разыгрывались отдельно для каждого бота: 128 ботов
+  // проходили 128 разных испытаний, а их приспособленности сравнивались
+  // напрямую в отборе. Дисперсия среды при этом сопоставима с разницей
+  // между хорошим и плохим геномом, то есть отбор шёл по шуму.
+  var startPosition := FindEmptyInTemp;
+  if startPosition.X < 0 then
+    startPosition := Point.Create(FIELD_WIDTH div 2, FIELD_HEIGHT div 2);
+  tempField[startPosition.X, startPosition.Y] := BotCell;
+
+  var placedApples := 0;
+  for rowIndex := 1 to currentAppleCount do
+  begin
+    var applePosition := FindEmptyInTemp;
+    if applePosition.X < 0 then break;
+    tempField[applePosition.X, applePosition.Y] := Apple;
+    Inc(placedApples);
+  end;
+  for rowIndex := 1 to POISON_COUNT do
+  begin
+    var poisonPosition := FindEmptyInTemp;
+    if poisonPosition.X < 0 then break;
+    tempField[poisonPosition.X, poisonPosition.Y] := Poison;
+  end;
+
+  // Копирование готовой раскладки всем ботам
   for botIndex := 0 to MAXIMUM_BOTS - 1 do
+  begin
     for rowIndex := 0 to FIELD_WIDTH - 1 do
       for colIndex := 0 to FIELD_HEIGHT - 1 do
         botFields[botIndex, rowIndex, colIndex] := tempField[rowIndex, colIndex];
-
-  // Размещение ботов
-  var position := FindEmptyPosition(0);
-  if (position.X < 0) or (position.Y < 0) then
-    position := Point.Create(FIELD_WIDTH div 2, FIELD_HEIGHT div 2);
-  for botIndex := 0 to MAXIMUM_BOTS - 1 do
-  begin
-    botFields[botIndex, position.X, position.Y] := BotCell;
-    bots[botIndex].x := position.X;
-    bots[botIndex].y := position.Y;
+    bots[botIndex].x := startPosition.X;
+    bots[botIndex].y := startPosition.Y;
     bots[botIndex].active := true;
-    position := FindEmptyPosition(botIndex); // Новая позиция для следующего бота
-  end;
-
-  // Размещение яблок и яда
-  for botIndex := 0 to MAXIMUM_BOTS - 1 do
-  begin
-    botAppleCount[botIndex] := 0;
-    for rowIndex := 0 to currentAppleCount - 1 do
-      PlaceApple(botIndex);
-    for rowIndex := 0 to 9 do
-    begin
-      position := FindEmptyPosition(botIndex);
-      if (position.X >= 0) and (position.Y >= 0) then
-        botFields[botIndex, position.X, position.Y] := Poison;
-    end;
+    botAppleCount[botIndex] := placedApples;
   end;
 end;
 
-procedure RenderGraph(data: array of real; xLeft, yTop, width, height: integer);
+/// Рисует одну серию в своём собственном масштабе. Общий масштаб для
+/// приспособленности (очки) и длительности поколения (миллисекунды) делал
+/// вторую кривую нечитаемой: она прижималась к нижнему краю.
+procedure RenderSeries(data: array of real; count, xLeft, yTop, width, height: integer;
+                       lineColor: Color; drawPoints: boolean);
 var
   index: integer;
-  graphXPoints, graphYPoints: array of real;
-  avgGraphXPoints, avgGraphYPoints: array of real;
-  minFitness, maxFitness, minDuration, maxDuration, scaleX, scaleY: real;
-  averageFitness: real;
+  minValue, maxValue, scaleX, scaleY: real;
+
+  function PointX(i: integer): integer;
+  begin
+    // Индекс 0 — самое свежее поколение, поэтому время идёт слева направо
+    if count > 1 then
+      Result := Round(xLeft + width - i * scaleX)
+    else
+      Result := xLeft + width;
+  end;
+
+  function PointY(i: integer): integer;
+  begin
+    if scaleY = 0 then
+      Result := Round(yTop + height / 2)
+    else
+      Result := Round(yTop + height - (data[i] - minValue) * scaleY);
+  end;
+
 begin
-  ClearWindow(emptyCellColor);
-  if Length(data) = 0 then exit;
-  
-  minFitness := 0;
-  minDuration := MinimumValue(data);
-  maxFitness := MaximumValue(data);
-  maxDuration := maxFitness;
-  averageFitness := 0;
-  for index := 0 to Length(data) - 1 do
-    averageFitness += data[index];
-  if Length(data) > 0 then
-    averageFitness /= Length(data);
-  
-  SetLength(graphXPoints, Length(data));
-  SetLength(graphYPoints, Length(data));
-  if Length(data) > 1 then
-    scaleX := width / (Length(data) - 1)
+  if count < 1 then exit;
+  minValue := data[0];
+  maxValue := data[0];
+  for index := 1 to count - 1 do
+  begin
+    if data[index] < minValue then minValue := data[index];
+    if data[index] > maxValue then maxValue := data[index];
+  end;
+  if count > 1 then
+    scaleX := width / (count - 1)
   else
     scaleX := 0;
-  if maxFitness = minFitness then
+  if maxValue = minValue then
     scaleY := 0
   else
-    scaleY := height / (maxFitness - minFitness);
-  
+    scaleY := height / (maxValue - minValue);
 
-  for index := 0 to Length(data) - 1 do
-  begin
-    graphXPoints[index] := xLeft + index * scaleX;
-    if scaleY = 0 then
-      graphYPoints[index] := yTop + height / 2
-    else
-      graphYPoints[index] := yTop + height - (data[index] - minFitness) * scaleY;
-  end;
-  
-  Pen.Color := clYellow;
+  Pen.Color := lineColor;
   Pen.Width := 1;
-  if Length(data) > 1 then
+  MoveTo(PointX(0), PointY(0));
+  for index := 1 to count - 1 do
+    LineTo(PointX(index), PointY(index));
+
+  if drawPoints then
   begin
-    MoveTo(Round(graphXPoints[0]), Round(graphYPoints[0]));
-    for index := 1 to Length(data) - 1 do
-      LineTo(Round(graphXPoints[index]), Round(graphYPoints[index]));
+    Brush.Color := lineColor;
+    Pen.Color := lineColor;
+    for index := 0 to count - 1 do
+      FillCircle(PointX(index), PointY(index), 2);
   end;
-  
-  Brush.Color := clWhite;
-  Pen.Color := clBlack;
-  Pen.Width := 1;
-  for index := 0 to Length(data) - 1 do
-    FillCircle(Round(graphXPoints[index]), Round(graphYPoints[index]), 2);
-  
+end;
+
+procedure RenderGraph(xLeft, yTop, width, height: integer);
+var
+  index: integer;
+  averageFitness, minFitness, maxFitness: real;
+begin
+  ClearWindow(emptyCellColor);
+  if historyFilled = 0 then
+  begin
+    DrawRectangledText(WINDOW_WIDTH div 2 - 150, WINDOW_HEIGHT div 2 - 20, 300, 40,
+                       'Идёт первое поколение...');
+    Redraw;
+    exit;
+  end;
+
   Pen.Color := clLightGray;
   Pen.Width := 1;
   for index := 1 to 4 do
@@ -871,31 +982,30 @@ begin
     Line(xLeft, Round(yTop + index * height / 5), xLeft + width, Round(yTop + index * height / 5));
     Line(Round(xLeft + index * width / 5), yTop, Round(xLeft + index * width / 5), yTop + height);
   end;
-  
-  if Length(averageFitnessHistory) > 1 then
+
+  // Считается только заполненная часть истории: незаполненные нули
+  // раньше занижали минимум и среднее все первые сто поколений.
+  RenderSeries(generationDurations, historyFilled, xLeft, yTop, width, height, clCyan, false);
+  RenderSeries(averageFitnessHistory, historyFilled, xLeft, yTop, width, height, clYellow, true);
+
+  minFitness := averageFitnessHistory[0];
+  maxFitness := averageFitnessHistory[0];
+  averageFitness := 0;
+  for index := 0 to historyFilled - 1 do
   begin
-    SetLength(avgGraphXPoints, Length(averageFitnessHistory));
-    SetLength(avgGraphYPoints, Length(averageFitnessHistory));
-    for index := 0 to Length(averageFitnessHistory) - 1 do
-    begin
-      avgGraphXPoints[index] := xLeft + index * (width / (Length(averageFitnessHistory) - 1));
-      if scaleY = 0 then
-        avgGraphYPoints[index] := yTop + height / 2
-      else
-        avgGraphYPoints[index] := yTop + height - (averageFitnessHistory[index] - minFitness) * scaleY;
-    end;
-    
-    Pen.Color := clCyan;
-    Pen.Width := 1;
-    MoveTo(Round(avgGraphXPoints[0]), Round(avgGraphYPoints[0]));
-    for index := 1 to Length(averageFitnessHistory) - 1 do
-      LineTo(Round(avgGraphXPoints[index]), Round(avgGraphYPoints[index]));
+    if averageFitnessHistory[index] < minFitness then minFitness := averageFitnessHistory[index];
+    if averageFitnessHistory[index] > maxFitness then maxFitness := averageFitnessHistory[index];
+    averageFitness += averageFitnessHistory[index];
   end;
-  
-  var graphInfo := 'MaxFitness = ' + maxDuration.ToString + newline +
-                   'MinFitness = ' + minDuration.ToString + newline +
-                   'AvgFitness = ' + Round(averageFitness).ToString;
-  DrawRectangledText(WINDOW_WIDTH div 2 - 100, WINDOW_HEIGHT - 100, 200, 80, graphInfo);
+  averageFitness /= historyFilled;
+
+  var graphInfo := 'Поколение ' + generationNumber.ToString +
+                   '   мутация ' + currentMutationRate.ToString('F3') + newline +
+                   'Приспособленность (жёлтая): макс ' + maxFitness.ToString('F1') +
+                   ', мин ' + minFitness.ToString('F1') + newline +
+                   'средняя за историю ' + averageFitness.ToString('F1') + newline +
+                   'Длительность поколения (голубая), своя шкала';
+  DrawRectangledText(WINDOW_WIDTH div 2 - 160, WINDOW_HEIGHT - 92, 320, 84, graphInfo);
   Redraw;
 end;
 
@@ -932,20 +1042,20 @@ begin
   begin
     if bots[rowIndex].active then
     begin
+      // За такт бот выполняет служебные команды (повороты, переходы,
+      // проверки) до первой команды движения, но не больше maximumThinkTime
+      // штук. Гибель обрывает такт немедленно: снятие с поля и уменьшение
+      // счётчика живых делает KillBot, поэтому отдельной проверки лимита
+      // действий здесь больше нет.
       var remainingCommands := maximumThinkTime - 1;
-      while (remainingCommands > 0) and (bots[rowIndex].genome[bots[rowIndex].genomePosition] <> 0) do
+      while (remainingCommands > 0) and bots[rowIndex].active and
+            (bots[rowIndex].genome[bots[rowIndex].genomePosition] <> 0) do
       begin
         ExecuteCommand(rowIndex, bots[rowIndex]);
         remainingCommands -= 1;
       end;
-      ExecuteCommand(rowIndex, bots[rowIndex]);
-      
-      if bots[rowIndex].actionCount >= MAXIMUM_ACTIONS then
-      begin
-        bots[rowIndex].active := false;
-        botFields[rowIndex, bots[rowIndex].x, bots[rowIndex].y] := Empty;
-        Dec(activeBotCount);
-      end;
+      if bots[rowIndex].active then
+        ExecuteCommand(rowIndex, bots[rowIndex]);
       
       if activeBotCount <= 0 then
       begin
@@ -953,14 +1063,16 @@ begin
         ResetField;
         activeBotCount := MAXIMUM_BOTS;
         Inc(generationNumber);
-        AddGenerationDuration(Milliseconds - generationStartTime);
+        var generationDuration := Milliseconds - generationStartTime;
+        AddGenerationDuration(generationDuration);
         generationStartTime := Milliseconds;
+        LogGeneration(generationDuration);
         // Заголовок окна обновляется здесь, а не в главном цикле:
         // SetWindowTitle маршалит вызов в поток окна и стоит дорого.
         UpdateStatus;
         if generationNumber > skipRenderGenerations then
           if viewMode = ViewGraph then
-            RenderGraph(generationDurations, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+            RenderGraph(12, 12, WINDOW_WIDTH - 24, WINDOW_HEIGHT - 120);
         exit;
       end;
     end;

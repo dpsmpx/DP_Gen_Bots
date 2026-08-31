@@ -23,6 +23,7 @@ const
 
 type
   CellType = (Empty, Wall, Apple, Poison, BotCell);
+  ViewModeType = (ViewField, ViewGraph);
   Bot = record
     active: boolean;
     x, y: integer;
@@ -49,8 +50,11 @@ var
   generationDurations: array of real;
   averageFitnessHistory: array of real;
   historySegmentCount: integer := 100;
-  isSimulationRendered: boolean := False;
+  ///Что показывать в окне: поле симуляции или график по поколениям
+  viewMode: ViewModeType := ViewGraph;
   isSimulationPaused: boolean := False;
+  ///Состояние кнопки мыши на прошлом кадре — для детекции фронта нажатия
+  wasMousePressed: boolean := False;
   skipRenderGenerations: integer := 0;
   emptyCellColor: Color := clGray;
   wallColor: Color := clBlack;
@@ -60,6 +64,9 @@ var
   stagnationCounter: integer := 0;
   currentMutationRate: real := BASE_MUTATION_RATE;
   currentAppleCount: integer := 30;
+  ///Сколько яблок сейчас на поле каждого бота. Позволяет не обходить
+  ///все 900 клеток каждый такт ради подсчёта.
+  botAppleCount: array[0..MAXIMUM_BOTS - 1] of integer;
   currentWallCount: integer := 270;
 
 procedure ResetField; forward;
@@ -109,6 +116,38 @@ begin
       exit;
     end;
   until botFields[botIndex, Result.X, Result.Y] = Empty;
+end;
+
+/// Возвращает случайную клетку заданного типа на поле бота или (-1, -1),
+/// если таких клеток нет. Равномерный выбор за один проход (резервуарная
+/// выборка), поэтому собирать список координат не нужно.
+function FindCellOfType(botIndex: integer; wanted: CellType): Point;
+var
+  seen: integer;
+begin
+  Result := Point.Create(-1, -1);
+  seen := 0;
+  for var x := 0 to FIELD_WIDTH - 1 do
+    for var y := 0 to FIELD_HEIGHT - 1 do
+      if botFields[botIndex, x, y] = wanted then
+      begin
+        Inc(seen);
+        if Random(seen) = 0 then
+          Result := Point.Create(x, y);
+      end;
+end;
+
+/// Кладёт яблоко в случайную свободную клетку поля бота.
+/// Возвращает False, если свободного места не нашлось.
+function PlaceApple(botIndex: integer): boolean;
+begin
+  var position := FindEmptyPosition(botIndex);
+  Result := (position.X >= 0) and (position.Y >= 0);
+  if Result then
+  begin
+    botFields[botIndex, position.X, position.Y] := Apple;
+    botAppleCount[botIndex] += 1;
+  end;
 end;
 
 function GetFrontPosition(x, y, direction: integer): Point;
@@ -228,9 +267,8 @@ begin
               bot.y := frontPosition.Y;
               botFields[botIndex, bot.x, bot.y] := BotCell;
               bot.fitness += 6;
-              var position := FindEmptyPosition(botIndex);
-              if (position.X >= 0) and (position.Y >= 0) then
-                botFields[botIndex, position.X, position.Y] := Apple;
+              botAppleCount[botIndex] -= 1;
+              PlaceApple(botIndex);
               hasMoved := true;
               if not bot.visited[bot.x, bot.y] then
               begin
@@ -273,9 +311,7 @@ begin
         begin
           botFields[botIndex, frontPosition.X, frontPosition.Y] := Empty;
           bot.fitness += 3;
-          var position := FindEmptyPosition(botIndex);
-          if (position.X >= 0) and (position.Y >= 0) then
-            botFields[botIndex, position.X, position.Y] := Apple;
+          PlaceApple(botIndex);
           hasMoved := true;
         end;
         bot.genomePosition := (bot.genomePosition + 1) mod GENOME_LENGTH;
@@ -594,7 +630,10 @@ var
   emptyCells: array of Point;
   emptyCount: integer;
   visited: array[0..FIELD_WIDTH - 1, 0..FIELD_HEIGHT - 1] of boolean;
-  queue: array of Point;
+  // Очередь BFS предвыделяется на всё поле и работает через индексы
+  // head/tail: извлечение и добавление за O(1) вместо сдвига массива.
+  queue: array[0..FIELD_WIDTH * FIELD_HEIGHT - 1] of Point;
+  queueHead, queueTail: integer;
 
   procedure UpdateEmptyCells(idx: integer);
   begin
@@ -622,7 +661,8 @@ var
       for var colIndex := 0 to FIELD_HEIGHT - 1 do
         visited[i, colIndex] := false;
 
-    SetLength(queue, 0);
+    queueHead := 0;
+    queueTail := 0;
     // Находим первую пустую клетку рядом
     var startX := -1;
     var startY := -1;
@@ -650,17 +690,15 @@ var
     end;
 
     // BFS для подсчета достижимых клеток
-    SetLength(queue, 1);
-    queue[0] := Point.Create(startX, startY);
+    queue[queueTail] := Point.Create(startX, startY);
+    Inc(queueTail);
     visited[startX, startY] := true;
     count := 1;
 
-    while Length(queue) > 0 do
+    while queueHead < queueTail do
     begin
-      p := queue[0];
-      for i := 1 to High(queue) do
-        queue[i - 1] := queue[i];
-      SetLength(queue, Length(queue) - 1);
+      p := queue[queueHead];
+      Inc(queueHead);
 
       for i := 0 to 3 do
       begin
@@ -670,8 +708,8 @@ var
         begin
           visited[newX, newY] := true;
           Inc(count);
-          SetLength(queue, Length(queue) + 1);
-          queue[High(queue)] := Point.Create(newX, newY);
+          queue[queueTail] := Point.Create(newX, newY);
+          Inc(queueTail);
         end;
       end;
     end;
@@ -757,12 +795,9 @@ begin
   // Размещение яблок и яда
   for botIndex := 0 to MAXIMUM_BOTS - 1 do
   begin
+    botAppleCount[botIndex] := 0;
     for rowIndex := 0 to currentAppleCount - 1 do
-    begin
-      position := FindEmptyPosition(botIndex);
-      if (position.X >= 0) and (position.Y >= 0) then
-        botFields[botIndex, position.X, position.Y] := Apple;
-    end;
+      PlaceApple(botIndex);
     for rowIndex := 0 to 9 do
     begin
       position := FindEmptyPosition(botIndex);
@@ -870,25 +905,27 @@ var
 begin
   for var botIndex := 0 to MAXIMUM_BOTS - 1 do
   begin
-    var appleCount := 0;
-    for rowIndex := 0 to FIELD_WIDTH - 1 do
-      for var colIndex := 0 to FIELD_HEIGHT - 1 do
-        if botFields[botIndex, rowIndex, colIndex] = Apple then
-          Inc(appleCount);
-    if appleCount < MINIMUM_APPLES then
+    if botAppleCount[botIndex] < MINIMUM_APPLES then
+      PlaceApple(botIndex);
+
+    // Сколько яблок распадётся в яд на этом такте. Розыгрыш идёт по числу
+    // яблок (порядка 30), а не по всем 900 клеткам поля; сканировать поле
+    // приходится только когда распад действительно случился — примерно
+    // в 3% тактов.
+    var decayCount := 0;
+    for var apple := 1 to botAppleCount[botIndex] do
+      if Random < APPLE_DECAY_PROBABILITY then
+        Inc(decayCount);
+
+    while decayCount > 0 do
     begin
-      var position := FindEmptyPosition(botIndex);
-      if (position.X >= 0) and (position.Y >= 0) then
-        botFields[botIndex, position.X, position.Y] := Apple;
+      var position := FindCellOfType(botIndex, Apple);
+      if (position.X < 0) or (position.Y < 0) then break;
+      botFields[botIndex, position.X, position.Y] := Poison;
+      botAppleCount[botIndex] -= 1;
+      Dec(decayCount);
     end;
   end;
-
-  for var botIndex := 0 to MAXIMUM_BOTS - 1 do
-    for rowIndex := 0 to FIELD_WIDTH - 1 do
-      for var colIndex := 0 to FIELD_HEIGHT - 1 do
-        if botFields[botIndex, rowIndex, colIndex] = Apple then
-          if Random < APPLE_DECAY_PROBABILITY then
-            botFields[botIndex, rowIndex, colIndex] := Poison;
   
   rowIndex := 0;
   while rowIndex < MAXIMUM_BOTS do
@@ -918,8 +955,11 @@ begin
         Inc(generationNumber);
         AddGenerationDuration(Milliseconds - generationStartTime);
         generationStartTime := Milliseconds;
+        // Заголовок окна обновляется здесь, а не в главном цикле:
+        // SetWindowTitle маршалит вызов в поток окна и стоит дорого.
+        UpdateStatus;
         if generationNumber > skipRenderGenerations then
-          if not isSimulationRendered then
+          if viewMode = ViewGraph then
             RenderGraph(generationDurations, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
         exit;
       end;
@@ -1011,28 +1051,37 @@ end;
 
 procedure HandleInput;
 begin
-  if AnyKeyPressed then
-  begin
-    while AnyKeyPressed do;
-    isSimulationRendered := not isSimulationRendered;
-  end;
-  if MousePressed then
-  begin
-    while MousePressed do;
+  // Реакция на фронт нажатия. Прежняя версия крутила пустой цикл, пока
+  // клавиша удерживается: это жгло ядро и блокировало симуляцию.
+  if IsKeyPressed(VK_SPACE) then
     isSimulationPaused := not isSimulationPaused;
-  end;
+  if IsKeyPressed(VK_G) then
+    viewMode := ViewGraph;
+  if IsKeyPressed(VK_F) then
+    viewMode := ViewField;
+
+  if MousePressed and not wasMousePressed then
+    if viewMode = ViewField then
+      viewMode := ViewGraph
+    else
+      viewMode := ViewField;
+  wasMousePressed := MousePressed;
 end;
 
 begin
   Initialize;
+  UpdateStatus;
   while true do
   begin
     HandleInput;
-    if not isSimulationPaused then
+    if isSimulationPaused then
+      // В паузе считать нечего — отдаём процессор системе вместо
+      // прокрутки пустого цикла на полной скорости.
+      Sleep(16)
+    else
       Update;
     if generationNumber > skipRenderGenerations then
-      if isSimulationRendered then
+      if viewMode = ViewField then
         Render;
-    UpdateStatus;
   end;
 end.

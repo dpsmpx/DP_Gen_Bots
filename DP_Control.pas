@@ -30,8 +30,6 @@ var
   MousePressed: boolean;
   ///Код нажатой кнопки мыши
   MouseCode: integer;
-  ///Изменился ли размер окна?
-  Resized: boolean;
 
 /// Приводит код клавиши к индексу таблицы; -1, если код не представим
 function NormalizeKeyCode(Key: integer): integer;
@@ -111,8 +109,6 @@ begin
   MousePressed := False;
 end;
 
-procedure Resize := Resized := True;
-
 begin
   for var code := 0 to KEY_CODE_LIMIT - 1 do
   begin
@@ -124,5 +120,4 @@ begin
   OnMouseDown := MouseDown;
   OnMouseMove := MouseMove;
   OnMouseUp := MouseUp;
-  OnResize := Resize;
 end.

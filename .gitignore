@@ -1,0 +1,8 @@
+# Результаты сборки PascalABC.NET
+*.exe
+*.pdb
+*.pcu
+*.mdb
+
+# Журнал прогона
+gen_bots_log.csv
